@@ -6,21 +6,26 @@ import threading
 
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 
-from facexlib.detection import init_detection_model
+from retinaface.retinaface import RetinaFace
 from net import build_model
 
 # --- SPEED OPTIMIZATION ---
 torch.backends.cudnn.benchmark = True
 
+# --- PATHS ---
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEIGHTS_DIR = os.path.join(PROJECT_ROOT, 'weights')
+ADAFACE_CHECKPOINT = os.path.join(WEIGHTS_DIR, 'adaface_ir101_ms1mv2.ckpt')
+RETINEFACE_CHECKPOINT = os.path.join(WEIGHTS_DIR, 'detection_mobilenet0.25_Final.pth')
+
 # --- SETTINGS ---
-CHECKPOINT_PATH = 'adaface_ir101_ms1mv2.ckpt'
 EMB_DB_PATH = 'vms_embeddings.npy'
 NAME_DB_PATH = 'vms_names.txt'
-THRESHOLD = 0.45
+THRESHOLD = 0.35
 DET_THRESH = 0.50           # RetinaFace confidence - surity this is a face or not
 NMS_THRESH = 0.40           # merge multiple boundary boxes to one
 MIN_FACE_SIZE = 10          # px, reject tiny faces
-SKIP_FRAMES = 2              # for speed: only run detection/recognition every N frames 
+SKIP_FRAMES = 2              # for speed: only run detection/recognition every N frames
 DETECTION_SCALE=1.2
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -76,11 +81,25 @@ def load_adaface(path):
         exit()
 
 
-# RetinaFace (ResNet50) on GPU via facexlib. PyTorch, no onnxruntime.
-# Weights auto-downloaded to ~/.cache/facexlib on first run.
-detector = init_detection_model('retinaface_mobile0.25', half=True, device=DEVICE)
+def load_retinaface(path, network='mobile0.25', half=True):
+    model = RetinaFace(network_name=network, half=half, device=DEVICE)
+    try:
+        state = torch.load(path, map_location=lambda s, l: s)
+        # strip DataParallel 'module.' prefix if present
+        state = {k[7:] if k.startswith('module.') else k: v for k, v in state.items()}
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        model = model.to(DEVICE)
+        return model
+    except Exception as e:
+        print(f"[FATAL] RetinaFace Load Error: {e}")
+        exit()
 
-adaface = load_adaface(CHECKPOINT_PATH)
+
+# RetinaFace mobile (PyTorch, no onnxruntime). Loaded from explicit weights path.
+detector = load_retinaface(RETINEFACE_CHECKPOINT, network='mobile0.25', half=True)
+
+adaface = load_adaface(ADAFACE_CHECKPOINT)
 
 # ArcFace 5-point template for 112x112 alignment.
 ARCFACE_DST = np.array([
