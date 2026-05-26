@@ -9,14 +9,19 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 from facexlib.detection import init_detection_model
 from net import build_model
 
+# --- SPEED OPTIMIZATION ---
+torch.backends.cudnn.benchmark = True
+
 # --- SETTINGS ---
 CHECKPOINT_PATH = 'adaface_ir101_ms1mv2.ckpt'
 EMB_DB_PATH = 'vms_embeddings.npy'
 NAME_DB_PATH = 'vms_names.txt'
 THRESHOLD = 0.45
-DET_THRESH = 0.50           # RetinaFace confidence
-NMS_THRESH = 0.40
+DET_THRESH = 0.50           # RetinaFace confidence - surity this is a face or not
+NMS_THRESH = 0.40           # merge multiple boundary boxes to one
 MIN_FACE_SIZE = 10          # px, reject tiny faces
+SKIP_FRAMES = 2              # for speed: only run detection/recognition every N frames 
+DETECTION_SCALE=1.2
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[SYSTEM] PyTorch Device: {DEVICE}")
@@ -63,6 +68,7 @@ def load_adaface(path):
                           if k.replace('model.', '') in model_dict}
         model.load_state_dict(new_state_dict, strict=False)
         model.to(DEVICE)
+        model.half()  # Use half precision for faster inference on compatible GPUs
         model.eval()
         return model
     except Exception as e:
@@ -72,7 +78,7 @@ def load_adaface(path):
 
 # RetinaFace (ResNet50) on GPU via facexlib. PyTorch, no onnxruntime.
 # Weights auto-downloaded to ~/.cache/facexlib on first run.
-detector = init_detection_model('retinaface_resnet50', half=False, device=DEVICE)
+detector = init_detection_model('retinaface_mobile0.25', half=True, device=DEVICE)
 
 adaface = load_adaface(CHECKPOINT_PATH)
 
@@ -85,6 +91,8 @@ ARCFACE_DST = np.array([
 
 def norm_crop(img, landmarks, size=112):
     M, _ = cv2.estimateAffinePartial2D(landmarks, ARCFACE_DST, method=cv2.LMEDS)
+    if M is None:
+        return np.zeros((size, size, 3), dtype=np.uint8)
     return cv2.warpAffine(img, M, (size, size), borderValue=0.0)
 
 
@@ -121,78 +129,117 @@ def admin_input_thread():
 def embed_batch(aligned_batch):
     # aligned_batch: tensor [N, 3, 112, 112] in [0,255], RGB.
     x = (aligned_batch - 127.5) / 128.0
-    x = x.to(DEVICE)
+    x = x.to(DEVICE).half()  # Use half precision for faster inference on compatible GPUs
     with torch.no_grad():
         feats, _ = adaface(x)
+    feats = feats.float()  # cast back to fp32 for DB matmul (KNOWN_EMBS is fp32)
     feats = feats / (torch.norm(feats, dim=1, keepdim=True) + 1e-8)
     return feats
 
+class VideoStream:
+    def __init__(self, src=0, width=1280, height=720):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.ret, self.frame = self.cap.read()
+        self.stopped = False
+
+    def start(self):
+        threading.Thread(target=self.update, daemon=True).start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame = frame
+
+    def read(self):
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+        self.cap.release()
+
 
 # --- MAIN LOOP ---
-cap = cv2.VideoCapture(0)
-
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-
-actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+vs = VideoStream(src=0, width=1280, height=720).start()
+actual_w = vs.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+actual_h = vs.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
 print(f"[SYSTEM] Camera Resolution: {actual_w}x{actual_h}")
+frame_count = 0
+last_results = []  # Stores (box, name, color, feat) for persistent drawing
+current_frame_unknown_feat = None
+
+print("[SYSTEM] Loop starting at target 20+ FPS...")
 
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    frame = vs.read()
+    if frame is None:
+        continue
 
-    # RetinaFace (facexlib) expects BGR ndarray. AdaFace crops built from RGB.
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_count += 1
 
-    with torch.no_grad():
-        dets = detector.detect_faces(frame, conf_threshold=DET_THRESH, nms_threshold=NMS_THRESH)
-    # dets: [N,15] = x1,y1,x2,y2,score, (lex,ley,rex,rey,nx,ny,lmx,lmy,rmx,rmy)
+    # ONLY RUN AI EVERY 'SKIP_FRAMES'
+    if frame_count % SKIP_FRAMES == 0:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        with torch.no_grad():
+            # Detect using MobileNet (fast)
+            dets = detector.detect_faces(frame, conf_threshold=DET_THRESH, nms_threshold=NMS_THRESH)
+        
+        # Reset results for this AI pass
+        new_results = []
+        current_frame_unknown_feat = None 
 
-    current_frame_unknown_feat = None
+        if dets is not None and len(dets) > 0:
+            crops, kept_boxes = [], []
+            for det in dets:
+                box = det[0:4].astype(int)
+                lmks = det[5:15].reshape(5, 2).astype(np.float32)
 
-    if dets is not None and len(dets) > 0:
-        crops, kept = [], []
-        for det in dets:
-            score = float(det[4])
-            box = det[0:4].astype(int)
-            lmks = det[5:15].reshape(5, 2).astype(np.float32)
+                # Filter tiny faces
+                if min(box[2]-box[0], box[3]-box[1]) < MIN_FACE_SIZE:
+                    continue
 
-            w, h = box[2] - box[0], box[3] - box[1]
-            if min(w, h) < MIN_FACE_SIZE:
-                continue
+                crops.append(norm_crop(rgb, lmks, size=112))
+                kept_boxes.append(box)
 
-            crops.append(norm_crop(rgb, lmks, size=112))
-            kept.append((box, score))
+            if crops:
+                # Prepare batch for AdaFace (Half Precision)
+                batch_np = np.stack(crops, axis=0)
+                batch = torch.from_numpy(batch_np).permute(0, 3, 1, 2).contiguous().to(DEVICE).half()
+                feats = embed_batch(batch)
 
-        if crops:
-            batch_np = np.stack(crops, axis=0)  # [N,112,112,3] RGB uint8
-            batch = torch.from_numpy(batch_np).permute(0, 3, 1, 2).contiguous().float()
-            feats = embed_batch(batch)
+                for i, box in enumerate(kept_boxes):
+                    name = "Unknown"
+                    color = (0, 0, 255)
+                    feat = feats[i:i+1]
 
-            for i, (box, score) in enumerate(kept):
-                name = "Unknown"
-                color = (0, 0, 255)
+                    if KNOWN_EMBS is not None and len(KNOWN_NAMES) > 0:
+                        # Vector matching
+                        sims = torch.mm(feat, KNOWN_EMBS.t())
+                        max_val, max_idx = torch.max(sims, dim=1)
+                        
+                        if max_val.item() >= THRESHOLD:
+                            name = f"{KNOWN_NAMES[max_idx.item()]} ({max_val.item():.2f})"
+                            color = (0, 255, 0)
 
-                feat = feats[i:i+1]
-                if KNOWN_EMBS is not None and len(KNOWN_NAMES) > 0:
-                    sims = torch.mm(feat, KNOWN_EMBS.t())
-                    max_val, max_idx = torch.max(sims, dim=1)
-                    idx = max_idx.item()
+                    if name == "Unknown":
+                        current_frame_unknown_feat = feat
+                    
+                    new_results.append((box, name, color))
+        
+        # Update the persistent results
+        last_results = new_results
 
-                    if max_val.item() >= THRESHOLD and idx < len(KNOWN_NAMES):
-                        name = f"{KNOWN_NAMES[idx]} ({max_val.item():.2f})"
-                        color = (0, 255, 0)
+    # DRAWING SECTION (Happens every frame for maximum smoothness)
+    for box, name, color in last_results:
+        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
+        cv2.putText(frame, name, (box[0], box[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                if name == "Unknown":
-                    current_frame_unknown_feat = feat
-
-                cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-                cv2.putText(frame, name, (box[0], box[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    cv2.imshow("VMS GPU", frame)
+    cv2.imshow("VMS GPU - 20FPS", frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('e') and not is_naming and current_frame_unknown_feat is not None:
@@ -202,5 +249,5 @@ while True:
     elif key == ord('q'):
         break
 
-cap.release()
+vs.stop() # Clean up the thread
 cv2.destroyAllWindows()
