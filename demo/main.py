@@ -9,6 +9,7 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from retinaface.retinaface import RetinaFace
 from net import build_model
+from osnet_arch import osnet_x0_25
 
 # --- SPEED OPTIMIZATION ---
 torch.backends.cudnn.benchmark = True
@@ -18,6 +19,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEIGHTS_DIR = os.path.join(PROJECT_ROOT, 'weights')
 ADAFACE_CHECKPOINT = os.path.join(WEIGHTS_DIR, 'adaface_ir101_ms1mv2.ckpt')
 RETINEFACE_CHECKPOINT = os.path.join(WEIGHTS_DIR, 'detection_mobilenet0.25_Final.pth')
+OSNET_CHECKPOINT = os.path.join(WEIGHTS_DIR, 'osnet_x0_25_imagenet.pth')
 
 # --- SETTINGS ---
 EMB_DB_PATH = 'vms_embeddings.npy'
@@ -28,6 +30,7 @@ NMS_THRESH = 0.40           # merge multiple boundary boxes to one
 MIN_FACE_SIZE = 30          # px, reject tiny faces
 SKIP_FRAMES = 2              # for speed: only run detection/recognition every N frames
 DETECTION_SCALE=1.2
+OSNET_THRESH = 0.60          # body ReID cosine match threshold
 
 # --- CAMERA SOURCES ---
 # (label, src) — label shown on window + logs. src can be int (local) or URL (remote stream).
@@ -114,6 +117,35 @@ detector = load_retinaface(RETINEFACE_CHECKPOINT, network='mobile0.25', half=Tru
 
 adaface = load_adaface(ADAFACE_CHECKPOINT)
 
+
+OSNET_INPUT_H, OSNET_INPUT_W = 256, 128
+OSNET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(DEVICE)
+OSNET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(DEVICE)
+
+
+def load_osnet():
+    if not os.path.exists(OSNET_CHECKPOINT):
+        print(f"[WARN] OSNet checkpoint missing at {OSNET_CHECKPOINT}. Body ReID disabled.")
+        return None
+    try:
+        model = osnet_x0_25(num_classes=1000, pretrained=False, loss='softmax')
+        ckpt = torch.load(OSNET_CHECKPOINT, map_location=DEVICE)
+        state = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+        # Strip classifier head — we only need features in eval mode.
+        state = {k: v for k, v in state.items() if not k.startswith('classifier')}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if unexpected:
+            print(f"[WARN] OSNet unexpected keys: {len(unexpected)} (ignored)")
+        model.eval().to(DEVICE)
+        print("[SYSTEM] OSNet loaded (body ReID active).")
+        return model
+    except Exception as e:
+        print(f"[WARN] OSNet load failed: {e}. Body ReID disabled.")
+        return None
+
+
+osnet = load_osnet()
+
 # ArcFace 5-point template for 112x112 alignment.
 ARCFACE_DST = np.array([
     [38.2946, 51.6963], [73.5318, 51.5014],
@@ -126,6 +158,38 @@ def norm_crop(img, landmarks, size=112):
     if M is None:
         return np.zeros((size, size, 3), dtype=np.uint8)
     return cv2.warpAffine(img, M, (size, size), borderValue=0.0)
+
+
+def body_crop(frame, box, scale_h=3.5, scale_w=1.5):
+    """Expand face box downward to estimate full-body region."""
+    x1, y1, x2, y2 = box
+    fh, fw = y2 - y1, x2 - x1
+    cx = (x1 + x2) // 2
+    new_w = int(fw * scale_w)
+    bx1 = max(0, cx - new_w // 2)
+    bx2 = min(frame.shape[1], cx + new_w // 2)
+    by1 = max(0, y1 - int(fh * 0.2))
+    by2 = min(frame.shape[0], y1 + int(fh * scale_h))
+    crop = frame[by1:by2, bx1:bx2]
+    return crop if crop.size > 0 else None
+
+
+def osnet_embed(crops_bgr):
+    """Extract OSNet body embeddings. crops_bgr: list of BGR numpy arrays (variable size).
+    Returns [N, feature_dim] L2-normalized fp32 tensor on DEVICE."""
+    batch = []
+    for crop in crops_bgr:
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(rgb, (OSNET_INPUT_W, OSNET_INPUT_H))   # cv2 expects (W, H)
+        batch.append(rgb)
+    x = np.stack(batch, axis=0).astype(np.float32) / 255.0
+    x = torch.from_numpy(x).permute(0, 3, 1, 2).contiguous().to(DEVICE)
+    x = (x - OSNET_MEAN) / OSNET_STD
+    with torch.no_grad():
+        feats = osnet(x)
+    feats = feats.float()
+    feats = feats / (torch.norm(feats, dim=1, keepdim=True) + 1e-8)
+    return feats
 
 
 def save_to_db(name, vector):
@@ -181,6 +245,7 @@ def admin_input_thread():
             return
         save_to_db(name, feat)
         unknown_gallery.remove(eid)
+        body_gallery.remove(eid)
     finally:
         is_naming = False
 
@@ -230,6 +295,34 @@ class UnknownGallery:
             self.entries[eid] = {'feat': feat.detach().clone(), 'last_seen': now, 'count': 1}
             return eid, 0.0
 
+    def find_match(self, feat):
+        """Read-only lookup. Returns (eid, sim) if above threshold, else (None, 0.0)."""
+        with self.lock:
+            if not self.entries:
+                return None, 0.0
+            ids = list(self.entries.keys())
+            stack = torch.cat([self.entries[i]['feat'] for i in ids], dim=0)
+            sims = torch.mm(feat, stack.t())
+            max_val, max_idx = torch.max(sims, dim=1)
+            if max_val.item() >= self.match_thresh:
+                return ids[max_idx.item()], float(max_val.item())
+            return None, float(max_val.item())
+
+    def update_entry(self, eid, feat, now):
+        """Update existing entry with EMA. Creates entry with given eid if absent."""
+        with self.lock:
+            if eid in self.entries:
+                e = self.entries[eid]
+                if self.ema > 0:
+                    merged = self.ema * feat + (1 - self.ema) * e['feat']
+                    merged = merged / (torch.norm(merged, dim=1, keepdim=True) + 1e-8)
+                    e['feat'] = merged
+                e['last_seen'] = now
+                e['count'] += 1
+            else:
+                self.entries[eid] = {'feat': feat.detach().clone(), 'last_seen': now, 'count': 1}
+                self.next_id = max(self.next_id, eid + 1)
+
     def evict(self, now):
         with self.lock:
             stale = [k for k, v in self.entries.items() if now - v['last_seen'] > self.ttl]
@@ -258,6 +351,7 @@ class UnknownGallery:
 
 
 unknown_gallery = UnknownGallery()
+body_gallery = UnknownGallery(match_thresh=OSNET_THRESH, ttl=UNKNOWN_TTL_SECONDS, ema=0.5)
 
 
 class VideoStream:
@@ -338,7 +432,31 @@ def process_frame(frame, now):
                         matched_known = True
 
                 if not matched_known:
-                    eid, _ = unknown_gallery.assign(feat, now)
+                    # Stage 1: face gallery match
+                    face_eid, _ = unknown_gallery.find_match(feat)
+                    if face_eid is not None:
+                        unknown_gallery.update_entry(face_eid, feat, now)
+                        eid = face_eid
+                    else:
+                        # Stage 2: body ReID fallback (handles extreme angles / side faces)
+                        eid = None
+                        bfeat = None
+                        if osnet is not None:
+                            bcrop = body_crop(frame, box)
+                            if bcrop is not None:
+                                bfeat = osnet_embed([bcrop])
+                                body_eid, _ = body_gallery.find_match(bfeat)
+                                if body_eid is not None:
+                                    eid = body_eid
+                                    unknown_gallery.update_entry(eid, feat, now)
+                                    body_gallery.update_entry(eid, bfeat, now)
+
+                        if eid is None:
+                            # Genuinely new person
+                            eid, _ = unknown_gallery.assign(feat, now)
+                            if bfeat is not None:
+                                body_gallery.update_entry(eid, bfeat, now)
+
                     name = f"Unknown_{eid:03d}"
                     color = (0, 0, 255)
 
@@ -371,6 +489,7 @@ while True:
     now = time.time()
     if now - last_evict > 5.0:
         unknown_gallery.evict(now)
+        body_gallery.evict(now)
         last_evict = now
 
     for vs in active_streams:
@@ -397,6 +516,7 @@ while True:
         threading.Thread(target=admin_input_thread, daemon=True).start()
     elif key == ord('c'):
         n = unknown_gallery.clear()
+        body_gallery.clear()
         print(f"[GALLERY] Cleared {n} unknown entries. IDs reset to 001.")
     elif key == ord('q'):
         break
