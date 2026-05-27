@@ -7,4 +7,5 @@ __pycache__/
 *.onnx
 */__pycache__/
 *.data
+*.npy
 weights
