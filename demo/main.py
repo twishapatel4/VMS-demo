@@ -29,13 +29,45 @@ OSNET_CHECKPOINT = os.path.join(WEIGHTS_DIR, 'osnet_x0_25_imagenet.pth')
 EMB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'embeddings')
 KNOWN_DIR = os.path.join(EMB_ROOT, 'known')
 UNKNOWN_DIR = os.path.join(EMB_ROOT, 'unknown')
+BODY_DIR = os.path.join(EMB_ROOT, 'body')   # NEW: body ReID embeds persisted to disk (FLOW2 hybrid)
 THRESHOLD = 0.35
 DET_THRESH = 0.30           # RetinaFace confidence - surity this is a face or not
 NMS_THRESH = 0.25          # merge multiple boundary boxes to one
 MIN_FACE_SIZE = 20          # px, reject tiny faces
-SKIP_FRAMES = 1              # for speed: only run detection/recognition every N frames
+SKIP_FRAMES = 1              # main loop: call process_frame every N frames (1 = every frame)
+
+# === [FLOW2-RISK #4] identify-every-2nd-frame ==============================
+# CHANGE : detection + ByteTrack still run every frame, but AdaFace embed +
+#          cascade match + Branch B bind only fire every IDENTIFY_INTERVAL frames.
+#          Branch A label cache draws on skip frames so motion stays smooth.
+# REASON : ~50% AdaFace compute saved per FLOW2.
+# REVERT : set IDENTIFY_INTERVAL = 1
+# ACCURACY: new tid first appearing on skip frame has no label until next
+#          identify frame (~33ms). No drop on already-bound tracks.
+# ===========================================================================
+IDENTIFY_INTERVAL = 2
+
 DETECTION_SCALE=1.2
-OSNET_THRESH = 0.80          # body ReID cosine match threshold
+OSNET_THRESH = 0.80          # body ReID cosine match threshold (kept current; FLOW2 said 0.60)
+
+# === [FLOW2-RISK #7] body-crop-validity-gate ===============================
+# CHANGE : body_crop now returns None unless crop.w >= BODY_CROP_MIN_W and
+#          crop.h >= BODY_CROP_MIN_H. Drives FLOW2 unknown path left/right gate.
+# REASON : tiny crops give noisy OSNet embeds → bad body matches → wrong reuse.
+# REVERT : set BODY_CROP_MIN_W = 0, BODY_CROP_MIN_H = 0
+# ACCURACY: distant subjects route to face-only branch. Alice-fix
+#          (face DB cross-check on body NO MATCH) catches the duplicate case.
+# ===========================================================================
+BODY_CROP_MIN_W = 80
+BODY_CROP_MIN_H = 40
+
+# === [FLOW2-NEW] secondary-face-check-threshold ============================
+# Used when body_gallery matches (≥ OSNET_THRESH). Verifies the face embed
+# stored at that eid also matches the current face embed at ≥ this threshold.
+# Prevents identity pollution from same-clothes false body matches.
+# REVERT : set very low (e.g. 0.0) to effectively disable the check.
+# ===========================================================================
+SECONDARY_FACE_THRESH = 0.35
 
 # --- DETECTION PERF / FILTER GATES ---
 DETECT_SCALE = 1.0           # downscale frame before RetinaFace forward; boxes scaled back. 1.0 = no downscale.
@@ -57,12 +89,18 @@ STATS_EVERY_FRAMES = 60      # print FPS + gallery stats every N frames
 # (label, src) — label shown on window + logs. src can be int (local) or URL (remote stream).
 CAM_SOURCES = [
     ("Laptop",  0),
-    # ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
-    # ("Webcam1",  "http://192.168.29.218:5000/video"), # JeelBhai
+    ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
+    ("Webcam1",  "http://192.168.29.218:5000/video"), # JeelBhai~
 ]
 
 # --- SHORT-TERM MEMORY (Temporary Unknown Gallery) ---
-UNKNOWN_THRESH = 0.42     # cross-frame stranger match; lowered because EMA centroid is cleaner than raw embed
+# === [FLOW2-RISK #5] face-fallback-threshold ===============================
+# CHANGE : UNKNOWN_THRESH lowered 0.42 → 0.40 to match FLOW2 face-fallback spec.
+# REASON : FLOW2 alignment.
+# REVERT : set UNKNOWN_THRESH = 0.42
+# ACCURACY: small step (0.02); minor risk of cross-person reuse at borderline.
+# ===========================================================================
+UNKNOWN_THRESH = 0.40     # cross-frame stranger match (FLOW2 hybrid)
 UNKNOWN_TTL_SECONDS = 7200   # 2 hours
 UNKNOWN_EMA_ALPHA = 0.3      # running avg: new_feat * alpha + old_feat * (1-alpha); 0 = no update
 
@@ -300,7 +338,12 @@ def frontality_weight(fscore):
 
 
 def body_crop(frame, box, scale_h=3.5, scale_w=1.5):
-    """Expand face box downward to estimate full-body region."""
+    """Expand face box downward to estimate full-body region.
+
+    Returns None if the resulting crop is too small to be useful for OSNet —
+    this is what FLOW2's 'body crop valid?' gate checks.
+    See [FLOW2-RISK #7] BODY_CROP_MIN_W / BODY_CROP_MIN_H above.
+    """
     x1, y1, x2, y2 = box
     fh, fw = y2 - y1, x2 - x1
     cx = (x1 + x2) // 2
@@ -310,7 +353,13 @@ def body_crop(frame, box, scale_h=3.5, scale_w=1.5):
     by1 = max(0, y1 - int(fh * 0.2))
     by2 = min(frame.shape[0], y1 + int(fh * scale_h))
     crop = frame[by1:by2, bx1:bx2]
-    return crop if crop.size > 0 else None
+    if crop.size == 0:
+        return None
+    h, w = crop.shape[:2]
+    # [FLOW2-RISK #7] body-crop validity gate. See constant defs.
+    if w < BODY_CROP_MIN_W or h < BODY_CROP_MIN_H:
+        return None
+    return crop
 
 
 def osnet_embed(crops_bgr):
@@ -378,6 +427,7 @@ def admin_input_thread():
             n = unknown_gallery.clear()
             body_gallery.clear()
             wipe_unknown_dir()
+            wipe_body_dir()
             for cs in cam_states.values():
                 cs.reset_all_tracks()
             print(f"[GALLERY] Cleared {n} unknown entries (RAM + disk). IDs reset to 001.")
@@ -399,6 +449,7 @@ def admin_input_thread():
         unknown_gallery.remove(eid)
         body_gallery.remove(eid)
         delete_unknown_file(eid)
+        delete_body_file(eid)
         invalidate_eid_bindings(eid)
         print(f"[REGISTER] Invalidated track bindings for eid #{eid:03d}. Box flips to green within ~200ms.")
     finally:
@@ -491,10 +542,24 @@ class UnknownGallery:
 
     def update_entry(self, eid, feat, now, weight=1.0):
         """EMA-blend fresh embed into stored slot, scaled by weight.
-        NO-OP if eid was removed (prevents stale track from resurrecting promoted/cleared eids)."""
+
+        If eid is missing, create the entry at that eid. Required so body_gallery
+        (which always follows unknown_gallery's auto-incremented eid) can be
+        populated without auto-incrementing its own next_id.
+        """
         with self.lock:
             if eid in self.entries:
                 self._ema_blend_unsafe(eid, feat, now, weight=weight)
+            else:
+                # [BUG-FIX] previously this was a no-op when eid missing; body_gallery
+                # therefore never accumulated entries. Create-on-miss so FLOW2 hybrid
+                # cascade can attach body embeds at the eid chosen by unknown_gallery.
+                self.entries[eid] = {
+                    'embeds': deque([feat.detach().clone()], maxlen=self.maxlen),
+                    'last_seen': now,
+                    'count': 1,
+                }
+                self.next_id = max(self.next_id, eid + 1)
 
     def evict(self, now):
         with self.lock:
@@ -617,7 +682,92 @@ def persist_all_unknowns():
             np.save(_unknown_path(eid), stack)
 
 
+# --- BODY GALLERY DISK PERSISTENCE (FLOW2 hybrid) ---
+# Mirror of the face-gallery helpers above but for body_gallery. Files live in
+# BODY_DIR keyed by the SAME eid as the face file. Body file may be absent for
+# an eid that was created via the body-invalid LEFT branch (face-only entry).
+def _body_path(eid):
+    return os.path.join(BODY_DIR, f"Body_{eid:03d}.npy")
+
+
+def persist_body(eid):
+    with body_gallery.lock:
+        e = body_gallery.entries.get(eid)
+        if e is None or not e['embeds']:
+            return
+        stack = torch.cat(list(e['embeds']), dim=0).cpu().numpy().astype(np.float32)
+    os.makedirs(BODY_DIR, exist_ok=True)
+    np.save(_body_path(eid), stack)
+
+
+def delete_body_file(eid):
+    p = _body_path(eid)
+    if os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def wipe_body_dir():
+    if not os.path.isdir(BODY_DIR):
+        return
+    for fname in os.listdir(BODY_DIR):
+        if fname.startswith('Body_') and fname.endswith('.npy'):
+            try:
+                os.remove(os.path.join(BODY_DIR, fname))
+            except OSError:
+                pass
+
+
+def load_bodies_from_disk():
+    """Repopulate body_gallery from BODY_DIR/*.npy."""
+    if not os.path.isdir(BODY_DIR):
+        return
+    now = time.time()
+    loaded = 0
+    with body_gallery.lock:
+        for fname in sorted(os.listdir(BODY_DIR)):
+            if not (fname.startswith('Body_') and fname.endswith('.npy')):
+                continue
+            try:
+                eid = int(fname[len('Body_'):-len('.npy')])
+            except ValueError:
+                continue
+            try:
+                arr = np.load(os.path.join(BODY_DIR, fname))
+            except Exception:
+                continue
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            embeds = deque(maxlen=body_gallery.maxlen)
+            for row in arr:
+                t = torch.from_numpy(row.reshape(1, -1)).to(DEVICE).float()
+                t = t / (torch.norm(t, dim=1, keepdim=True) + 1e-8)
+                embeds.append(t)
+            body_gallery.entries[eid] = {
+                'embeds': embeds,
+                'last_seen': now,
+                'count': arr.shape[0],
+            }
+            body_gallery.next_id = max(body_gallery.next_id, eid + 1)
+            loaded += 1
+    if loaded:
+        print(f"[CACHE] Loaded {loaded} body entries from {BODY_DIR}")
+
+
+def persist_all_bodies():
+    os.makedirs(BODY_DIR, exist_ok=True)
+    with body_gallery.lock:
+        for eid, e in body_gallery.entries.items():
+            if not e['embeds']:
+                continue
+            stack = torch.cat(list(e['embeds']), dim=0).cpu().numpy().astype(np.float32)
+            np.save(_body_path(eid), stack)
+
+
 load_unknowns_from_disk()
+load_bodies_from_disk()
 
 
 class VideoStream:
@@ -700,8 +850,17 @@ def _iou_xyxy(a, b):
 
 
 def process_frame(frame, now, cam_state, frame_idx):
-    """Detect → ByteTrack → (a) bound tracks: periodic EMA gallery update.
-                            (b) unbound tracks: accumulate TRACK_QUERY_BUFFER embeds, vote, bind."""
+    """Detect + ByteTrack every frame. Branch A label cache always drawn.
+    AdaFace embed + cascade match + new-tid bind fire only on identify frames
+    (gated by IDENTIFY_INTERVAL).
+
+    Unknown-path cascade follows FLOW2 hybrid:
+      * body-crop-valid gate splits left (face-only) vs right (body + secondary face check)
+      * Alice fix: on body NO MATCH, face DB cross-check at UNKNOWN_THRESH before CREATE NEW
+    """
+    # [FLOW2-RISK #4] identify gating
+    do_identify = (frame_idx % IDENTIFY_INTERVAL == 0)
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     if DETECT_SCALE < 1.0:
@@ -742,7 +901,7 @@ def process_frame(frame, now, cam_state, frame_idx):
 
     new_results = []
     pending_crops = []
-    pending_tags = []   # ("UPDATE", tid, eid, weight) | ("VOTE", tid, track_box, det_box, weight)
+    pending_tags = []   # ("UPDATE", tid, eid, weight) | ("BIND", tid, track_box, det_box, weight)
 
     for st in tracks:
         tid = st.track_id
@@ -756,10 +915,14 @@ def process_frame(frame, now, cam_state, frame_idx):
                 best_iou = v
                 best_i = i
 
-        # Branch A: tid already labeled → reuse + maybe contribute frontality-weighted EMA update.
+        # ---- Branch A: tid already labeled → reuse cached label (drawn every frame).
         if tid in cam_state.track_to_label:
             name, color = cam_state.track_to_label[tid]
             new_results.append((track_box, name, color))
+
+            # EMA refresh only on identify frames; cadence + quality gates unchanged.
+            if not do_identify:
+                continue
 
             eid = cam_state.track_to_eid.get(tid)
             if eid is None or best_i < 0 or best_iou < TRACK_DET_IOU_MIN:
@@ -781,16 +944,23 @@ def process_frame(frame, now, cam_state, frame_idx):
             cam_state.track_last_embed[tid] = frame_idx
             continue
 
-        # Branch B: tid not yet bound → need TRACK_QUERY_BUFFER embeds (weighted vote).
+        # ---- Branch B: unbound tid.
+        # [FLOW2-RISK #4] new tid on non-identify frame: draw nothing per spec.
+        if not do_identify:
+            continue
+
         if best_i < 0 or best_iou < TRACK_DET_IOU_MIN:
+            # Detection missed this track this frame → can't identify; placeholder.
             new_results.append((track_box, "...", (200, 200, 200)))
             continue
 
         det_box, lmks, _, fscore = kept_meta[best_i]
         weight = frontality_weight(fscore)
         pending_crops.append(norm_crop(rgb, lmks, size=112))
-        pending_tags.append(("VOTE", tid, track_box, det_box, weight))
+        # [FLOW2-RISK #1] BIND tag = first-frame bind (no 6-frame vote buffer).
+        pending_tags.append(("BIND", tid, track_box, det_box, weight))
 
+    # AdaFace forward only when there is at least one crop (gated by do_identify above).
     if pending_crops:
         batch_np = np.stack(pending_crops, axis=0)
         batch = torch.from_numpy(batch_np).permute(0, 3, 1, 2).contiguous().to(DEVICE)
@@ -800,34 +970,23 @@ def process_frame(frame, now, cam_state, frame_idx):
             feat = feats[i:i+1]
 
             if tag[0] == "UPDATE":
+                # Branch A periodic EMA refresh — unchanged from pre-FLOW2 behavior.
                 _, tid, eid, weight = tag
                 unknown_gallery.update_entry(eid, feat, now, weight=weight)
                 persist_unknown(eid)
                 continue
 
-            # VOTE — accumulate (feat, weight); resolve once buffer full via weighted mean.
+            # === [FLOW2-RISK #1] first-frame BIND + [FLOW2-RISK #3] hybrid cascade ===
             _, tid, track_box, det_box, weight = tag
-            buf = cam_state.track_query_buf.setdefault(tid, [])
-            buf.append((feat, weight))
-
-            if len(buf) < TRACK_QUERY_BUFFER:
-                new_results.append((track_box, "...", (200, 200, 200)))
-                continue
-
-            stack = torch.cat([f for f, _ in buf], dim=0)                        # [N, 512]
-            w_vec = torch.tensor([w for _, w in buf], device=stack.device,
-                                 dtype=stack.dtype).view(-1, 1)                  # [N, 1]
-            mean_feat = (stack * w_vec).sum(dim=0, keepdim=True) / (w_vec.sum() + 1e-8)
-            mean_feat = mean_feat / (torch.norm(mean_feat, dim=1, keepdim=True) + 1e-8)
-            cam_state.track_query_buf.pop(tid, None)
 
             name = "Unknown"
             color = (0, 0, 255)
             assigned_eid = None
             matched_known = False
 
+            # Known DB cosine check (unchanged).
             if KNOWN_EMBS is not None and len(KNOWN_NAMES) > 0:
-                sims = torch.mm(mean_feat, KNOWN_EMBS.t())
+                sims = torch.mm(feat, KNOWN_EMBS.t())
                 max_val, max_idx = torch.max(sims, dim=1)
                 if max_val.item() >= THRESHOLD:
                     name = f"{KNOWN_NAMES[max_idx.item()]} ({max_val.item():.2f})"
@@ -835,26 +994,57 @@ def process_frame(frame, now, cam_state, frame_idx):
                     matched_known = True
 
             if not matched_known:
-                face_eid, _ = unknown_gallery.find_match(mean_feat)
-                if face_eid is not None:
-                    unknown_gallery.update_entry(face_eid, mean_feat, now, weight=1.0)
-                    assigned_eid = face_eid
+                # ----- FLOW2 unknown path -----
+                bcrop = body_crop(frame, det_box) if osnet is not None else None
+                body_valid = bcrop is not None
+                body_written = False
+
+                if not body_valid:
+                    # LEFT BRANCH — face fallback at UNKNOWN_THRESH (FLOW2 0.40).
+                    face_eid, _ = unknown_gallery.find_match(feat)
+                    if face_eid is not None:
+                        unknown_gallery.update_entry(face_eid, feat, now, weight=1.0)
+                        assigned_eid = face_eid
+                    else:
+                        assigned_eid, _ = unknown_gallery.assign(feat, now, weight=1.0)
                 else:
-                    bfeat = None
-                    if osnet is not None:
-                        bcrop = body_crop(frame, det_box)
-                        if bcrop is not None:
-                            bfeat = osnet_embed([bcrop])
-                            body_eid, _ = body_gallery.find_match(bfeat)
-                            if body_eid is not None:
-                                assigned_eid = body_eid
-                                unknown_gallery.update_entry(assigned_eid, mean_feat, now, weight=1.0)
-                                body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
-                    if assigned_eid is None:
-                        assigned_eid, _ = unknown_gallery.assign(mean_feat, now, weight=1.0)
-                        if bfeat is not None:
+                    # RIGHT BRANCH — body lookup at OSNET_THRESH.
+                    bfeat = osnet_embed([bcrop])
+                    body_eid, _ = body_gallery.find_match(bfeat)
+
+                    if body_eid is not None:
+                        # Secondary face check (identity pollution prevention).
+                        face_stored = unknown_gallery.get_feat(body_eid)
+                        sec_match = False
+                        if face_stored is not None:
+                            sec_sim = float(torch.mm(feat, face_stored.t()).item())
+                            sec_match = (sec_sim >= SECONDARY_FACE_THRESH)
+
+                        if sec_match:
+                            # Same face — REUSE.
+                            assigned_eid = body_eid
+                            unknown_gallery.update_entry(assigned_eid, feat, now, weight=1.0)
                             body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
+                        else:
+                            # Diff face OR no face stored — CREATE NEW (FLOW2 literal).
+                            assigned_eid, _ = unknown_gallery.assign(feat, now, weight=1.0)
+                            body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
+                    else:
+                        # NO BODY MATCH — Alice fix: face DB cross-check before CREATE NEW.
+                        face_eid, _ = unknown_gallery.find_match(feat)
+                        if face_eid is not None:
+                            assigned_eid = face_eid
+                            unknown_gallery.update_entry(assigned_eid, feat, now, weight=1.0)
+                            body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
+                        else:
+                            assigned_eid, _ = unknown_gallery.assign(feat, now, weight=1.0)
+                            body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
+
+                    body_written = True
+
                 persist_unknown(assigned_eid)
+                if body_written:
+                    persist_body(assigned_eid)
                 name = f"Unknown_{assigned_eid:03d}"
                 color = (0, 0, 255)
 
@@ -954,11 +1144,13 @@ while True:
         n = unknown_gallery.clear()
         body_gallery.clear()
         wipe_unknown_dir()
+        wipe_body_dir()
         for cs in cam_states.values():
             cs.reset_all_tracks()
         print(f"[GALLERY] Cleared {n} unknown entries (RAM + disk). IDs reset to 001.")
     elif key == ord('q'):
         persist_all_unknowns()
+        persist_all_bodies()
         break
 
 for vs in streams:
