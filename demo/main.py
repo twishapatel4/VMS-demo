@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 
@@ -29,10 +30,10 @@ EMB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'embeddings'
 KNOWN_DIR = os.path.join(EMB_ROOT, 'known')
 UNKNOWN_DIR = os.path.join(EMB_ROOT, 'unknown')
 THRESHOLD = 0.35
-DET_THRESH = 0.55           # RetinaFace confidence - surity this is a face or not
+DET_THRESH = 0.30           # RetinaFace confidence - surity this is a face or not
 NMS_THRESH = 0.25          # merge multiple boundary boxes to one
-MIN_FACE_SIZE = 30          # px, reject tiny faces
-SKIP_FRAMES = 2              # for speed: only run detection/recognition every N frames
+MIN_FACE_SIZE = 20          # px, reject tiny faces
+SKIP_FRAMES = 1              # for speed: only run detection/recognition every N frames
 DETECTION_SCALE=1.2
 OSNET_THRESH = 0.80          # body ReID cosine match threshold
 
@@ -56,8 +57,8 @@ STATS_EVERY_FRAMES = 60      # print FPS + gallery stats every N frames
 # (label, src) — label shown on window + logs. src can be int (local) or URL (remote stream).
 CAM_SOURCES = [
     ("Laptop",  0),
-    ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
-    # ("Webcam",  "http://192.168.29.218:5000"), # JeelBhai
+    # ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
+    # ("Webcam1",  "http://192.168.29.218:5000/video"), # JeelBhai
 ]
 
 # --- SHORT-TERM MEMORY (Temporary Unknown Gallery) ---
@@ -72,7 +73,7 @@ GALLERY_WRITE_MIN_SCORE = 0.90   # det score required to write to gallery (quali
 GALLERY_WRITE_MIN_SIZE = 40      # px min face size for gallery writes
 
 # --- BYTETRACK (per-cam motion tracker; binds local track_id -> label) ---
-BYTETRACK_TRACK_THRESH = 0.5     # min det score to confirm a new track
+BYTETRACK_TRACK_THRESH = 0.30     # min det score to confirm a new track
 BYTETRACK_MATCH_THRESH = 0.8     # IoU cost upper bound for first association
 BYTETRACK_BUFFER = 90            # frames to keep lost tracks before removal (~3s @ 30fps)
 BYTETRACK_FRAME_RATE = 30        # nominal FPS for buffer scaling
@@ -345,6 +346,20 @@ def save_to_db(name, vector):
 is_naming = False
 
 
+def invalidate_eid_bindings(eid):
+    """Drop any track-cache binding pointing to a removed/promoted eid across all cams.
+    Without this, Branch A keeps drawing the cached (red Unknown_NNN) label until ByteTrack
+    kills the tid — even though the eid no longer exists in the unknown gallery."""
+    try:
+        cams = cam_states
+    except NameError:
+        return
+    for cs in cams.values():
+        dead = [t for t, e in cs.track_to_eid.items() if e == eid]
+        for t in dead:
+            cs.reset_track(t)
+
+
 def admin_input_thread():
     global is_naming
     try:
@@ -364,7 +379,7 @@ def admin_input_thread():
             body_gallery.clear()
             wipe_unknown_dir()
             for cs in cam_states.values():
-                cs.track_to_label.clear()
+                cs.reset_all_tracks()
             print(f"[GALLERY] Cleared {n} unknown entries (RAM + disk). IDs reset to 001.")
             return
         try:
@@ -384,6 +399,8 @@ def admin_input_thread():
         unknown_gallery.remove(eid)
         body_gallery.remove(eid)
         delete_unknown_file(eid)
+        invalidate_eid_bindings(eid)
+        print(f"[REGISTER] Invalidated track bindings for eid #{eid:03d}. Box flips to green within ~200ms.")
     finally:
         is_naming = False
 
@@ -473,17 +490,11 @@ class UnknownGallery:
             return None, best_sim
 
     def update_entry(self, eid, feat, now, weight=1.0):
-        """EMA-blend fresh embed into stored slot, scaled by weight. Creates entry if absent."""
+        """EMA-blend fresh embed into stored slot, scaled by weight.
+        NO-OP if eid was removed (prevents stale track from resurrecting promoted/cleared eids)."""
         with self.lock:
             if eid in self.entries:
                 self._ema_blend_unsafe(eid, feat, now, weight=weight)
-            else:
-                self.entries[eid] = {
-                    'embeds': deque([feat.detach().clone()], maxlen=self.maxlen),
-                    'last_seen': now,
-                    'count': 1,
-                }
-                self.next_id = max(self.next_id, eid + 1)
 
     def evict(self, now):
         with self.lock:
@@ -619,9 +630,9 @@ class VideoStream:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.opened = self.cap.isOpened()
+        # Skip blocking initial read; background thread (started in .start()) will populate self.frame.
+        # Main loop already handles `if frame is None: continue`.
         self.ret, self.frame = (False, None)
-        if self.opened:
-            self.ret, self.frame = self.cap.read()
         self.stopped = False
 
     def start(self):
@@ -661,6 +672,20 @@ class CamState:
         self.track_to_eid     = {}   # tid -> eid (only set for unknown bindings; known DB hits omitted)
         self.track_query_buf  = {}   # tid -> list[tensor[1,512]] embeds accumulating for vote
         self.track_last_embed = {}   # tid -> frame_idx of last gallery-update embed
+
+    def reset_track(self, tid):
+        """Drop a tid from all four per-track maps. Next detect frame re-votes via cascade."""
+        self.track_to_label.pop(tid, None)
+        self.track_to_eid.pop(tid, None)
+        self.track_query_buf.pop(tid, None)
+        self.track_last_embed.pop(tid, None)
+
+    def reset_all_tracks(self):
+        """Drop every binding across all four maps. Used by 'clear' admin op."""
+        self.track_to_label.clear()
+        self.track_to_eid.clear()
+        self.track_query_buf.clear()
+        self.track_last_embed.clear()
 
 
 def _iou_xyxy(a, b):
@@ -850,8 +875,18 @@ def process_frame(frame, now, cam_state, frame_idx):
 
 
 # --- MAIN LOOP ---
-streams = [VideoStream(src=src, label=label, width=1280, height=720).start()
-           for label, src in CAM_SOURCES]
+def _init_stream(args):
+    """Spawn a VideoStream — runs in worker thread so HTTP-cam handshakes overlap."""
+    label, src = args
+    t0 = time.time()
+    vs = VideoStream(src=src, label=label, width=1280, height=720).start()
+    print(f"[SYSTEM] {label} init in {time.time()-t0:.2f}s (opened={vs.opened})")
+    return vs
+
+
+with ThreadPoolExecutor(max_workers=max(1, len(CAM_SOURCES))) as _ex:
+    streams = list(_ex.map(_init_stream, CAM_SOURCES))
+
 active_streams = [vs for vs in streams if vs.opened]
 if not active_streams:
     print("[FATAL] No cameras opened. Exiting.")
@@ -920,7 +955,7 @@ while True:
         body_gallery.clear()
         wipe_unknown_dir()
         for cs in cam_states.values():
-            cs.track_to_label.clear()
+            cs.reset_all_tracks()
         print(f"[GALLERY] Cleared {n} unknown entries (RAM + disk). IDs reset to 001.")
     elif key == ord('q'):
         persist_all_unknowns()
