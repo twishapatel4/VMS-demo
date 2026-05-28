@@ -130,10 +130,35 @@ GALLERY_WRITE_MIN_SIZE = 40      # px min face size for gallery writes
 
 # --- BYTETRACK (per-cam motion tracker; binds local track_id -> label) ---
 BYTETRACK_TRACK_THRESH = 0.30     # min det score to confirm a new track
-BYTETRACK_MATCH_THRESH = 0.8     # IoU cost upper bound for first association
-BYTETRACK_BUFFER = 90            # frames to keep lost tracks before removal (~3s @ 30fps)
+# === [FLOW2-RISK #10] fast-motion tracking ================================
+# CHANGE : MATCH_THRESH 0.8 -> 0.9  (more permissive IoU first-pass association)
+#          BUFFER 90 -> 180         (lost track survives 6s vs 3s)
+# REASON : fast head motion makes Kalman prediction overshoot; default IoU
+#          + 3s buffer drop the labeled track too fast, causing the
+#          green->red->gray->green flicker on known persons.
+# REVERT : set MATCH_THRESH = 0.8 and BUFFER = 90.
+# ACCURACY: track holds longer through fast motion. Small crowd-swap risk
+#          if two faces overlap heavily — mitigated by Stage 2 identify_ok
+#          + stitching IoU gate.
+# ==========================================================================
+BYTETRACK_MATCH_THRESH = 0.9     # was 0.8 — see [FLOW2-RISK #10]
+BYTETRACK_BUFFER = 180           # was 90 — see [FLOW2-RISK #10]
 BYTETRACK_FRAME_RATE = 30        # nominal FPS for buffer scaling
 TRACK_DET_IOU_MIN = 0.3          # min IoU to associate a track to a detection for embedding
+
+# === [FLOW2-RISK #11] track stitching =====================================
+# When ByteTrack does drop a labeled tid (e.g. >6s of no usable detection)
+# and reassigns a fresh tid for the same person, recover the label without
+# running a 3-frame vote. Cache labeled bboxes; new tid spatially overlapping
+# a recently-lost label inherits it.
+# REASON : prevents green->red->gray flicker when ByteTrack reassigns tid.
+# REVERT : set STITCH_WINDOW_FRAMES = 0 (effectively disables match).
+# ACCURACY: rebind is instant + correct in 90%+ cases. Risk: another person
+#          walking into the spot within STITCH_WINDOW frames inherits old
+#          label. Mitigated by IoU gate.
+# ==========================================================================
+STITCH_WINDOW_FRAMES = 120       # ~4s @ 30fps; cache valid this long after tid lost
+STITCH_IOU_MIN = 0.3             # bbox overlap required between current track and cached entry
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"[SYSTEM] PyTorch Device: {DEVICE}")
@@ -469,6 +494,9 @@ def invalidate_eid_bindings(eid):
         dead = [t for t, e in cs.track_to_eid.items() if e == eid]
         for t in dead:
             cs.reset_track(t)
+        # [FLOW2-RISK #11] also drop stitch cache for the promoted eid so the
+        # old red "Unknown_NNN" doesn't get re-stitched onto a fresh tid.
+        cs.drop_stitch_for_eid(eid)
 
 
 def admin_input_thread():
@@ -884,20 +912,33 @@ class CamState:
         self.track_to_eid     = {}   # tid -> eid (only set for unknown bindings; known DB hits omitted)
         self.track_query_buf  = {}   # tid -> list[tensor[1,512]] embeds accumulating for vote
         self.track_last_embed = {}   # tid -> frame_idx of last gallery-update embed
+        # [FLOW2-RISK #11] stitch_cache: cache_key -> {'label','color','eid','box','frame_idx'}
+        # Updated every frame from labeled tids (Branch A); read by Branch B on new tid
+        # to inherit label without 3-frame vote when bbox overlaps recently-lost label.
+        self.stitch_cache     = {}
 
     def reset_track(self, tid):
-        """Drop a tid from all four per-track maps. Next detect frame re-votes via cascade."""
+        """Drop a tid from all per-track maps. Next detect frame re-votes via cascade.
+        stitch_cache intentionally NOT touched here — we want recently-lost labels
+        to remain available for spatial-rebind via Branch B stitching."""
         self.track_to_label.pop(tid, None)
         self.track_to_eid.pop(tid, None)
         self.track_query_buf.pop(tid, None)
         self.track_last_embed.pop(tid, None)
 
     def reset_all_tracks(self):
-        """Drop every binding across all four maps. Used by 'clear' admin op."""
+        """Drop every binding. Used by 'clear' admin op — also wipes stitch_cache."""
         self.track_to_label.clear()
         self.track_to_eid.clear()
         self.track_query_buf.clear()
         self.track_last_embed.clear()
+        self.stitch_cache.clear()
+
+    def drop_stitch_for_eid(self, eid):
+        """Remove stitch_cache entry for a given eid (called after register/promotion
+        so the old Unknown_NNN label isn't re-stitched onto a new track of the
+        now-promoted person)."""
+        self.stitch_cache.pop(('eid', eid), None)
 
 
 def _iou_xyxy(a, b):
@@ -909,6 +950,46 @@ def _iou_xyxy(a, b):
     area_b = max(0.0, (b[2] - b[0])) * max(0.0, (b[3] - b[1]))
     union = area_a + area_b - inter
     return inter / max(union, 1e-6)
+
+
+def _try_stitch_label(cam_state, track_box, frame_idx, alive_tids):
+    """[FLOW2-RISK #11] Recover a recently-lost label for a fresh tid via bbox overlap.
+
+    Returns dict {'label','color','eid'} on hit or None on miss. Also prunes
+    stitch_cache entries older than STITCH_WINDOW_FRAMES.
+
+    Skips cache entries belonging to currently-alive labeled tids — those are
+    the existing person, not a candidate for stitching onto a different tid.
+    """
+    if not cam_state.stitch_cache:
+        return None
+
+    # Compute set of (eid, name) currently alive so we don't steal someone's label.
+    alive_eids = {cam_state.track_to_eid[t] for t in alive_tids if t in cam_state.track_to_eid}
+    alive_known_names = {cam_state.track_to_label[t][0] for t in alive_tids
+                         if t in cam_state.track_to_label and t not in cam_state.track_to_eid}
+
+    expired = []
+    best_match, best_iou = None, 0.0
+    for key, info in cam_state.stitch_cache.items():
+        age = frame_idx - info['frame_idx']
+        if age > STITCH_WINDOW_FRAMES:
+            expired.append(key)
+            continue
+        # Don't stitch to a label that's already drawn on another live tid.
+        if key[0] == 'eid' and key[1] in alive_eids:
+            continue
+        if key[0] == 'known' and key[1] in alive_known_names:
+            continue
+        iou = _iou_xyxy(track_box, info['box'])
+        if iou >= STITCH_IOU_MIN and iou > best_iou:
+            best_iou = iou
+            best_match = info
+
+    for k in expired:
+        cam_state.stitch_cache.pop(k, None)
+
+    return best_match
 
 
 def process_frame(frame, now, cam_state, frame_idx):
@@ -991,6 +1072,9 @@ def process_frame(frame, now, cam_state, frame_idx):
     pending_crops = []
     pending_tags = []   # ("UPDATE", tid, eid, weight) | ("VOTE", tid, track_box, det_box, weight)
 
+    # [FLOW2-RISK #11] tid set used by stitching helper to skip currently-alive labels.
+    alive_tids = {st.track_id for st in tracks}
+
     for st in tracks:
         tid = st.track_id
         track_box = st.tlbr.astype(int)
@@ -1007,6 +1091,14 @@ def process_frame(frame, now, cam_state, frame_idx):
         if tid in cam_state.track_to_label:
             name, color = cam_state.track_to_label[tid]
             new_results.append((track_box, name, color))
+
+            # [FLOW2-RISK #11] update stitch cache so a tid losing event can be recovered.
+            eid_for_cache = cam_state.track_to_eid.get(tid)
+            cache_key = ('eid', eid_for_cache) if eid_for_cache is not None else ('known', name)
+            cam_state.stitch_cache[cache_key] = {
+                'label': name, 'color': color, 'eid': eid_for_cache,
+                'box': track_box.copy(), 'frame_idx': frame_idx,
+            }
 
             # EMA refresh only on identify frames; cadence + quality gates unchanged.
             if not do_identify:
@@ -1037,6 +1129,19 @@ def process_frame(frame, now, cam_state, frame_idx):
             continue
 
         # ---- Branch B: unbound tid.
+
+        # [FLOW2-RISK #11] try stitching first — runs every frame (no AdaFace needed).
+        # If a recently-lost labeled tid has bbox IoU >= STITCH_IOU_MIN with this
+        # tid's box, inherit its label + eid directly. No vote, instant rebind.
+        stitched = _try_stitch_label(cam_state, track_box, frame_idx, alive_tids)
+        if stitched is not None:
+            cam_state.track_to_label[tid] = (stitched['label'], stitched['color'])
+            if stitched['eid'] is not None:
+                cam_state.track_to_eid[tid] = stitched['eid']
+            cam_state.track_last_embed[tid] = frame_idx
+            new_results.append((track_box, stitched['label'], stitched['color']))
+            continue
+
         # [FLOW2-RISK #4] new tid on non-identify frame: draw nothing per spec.
         if not do_identify:
             continue
