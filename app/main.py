@@ -162,6 +162,7 @@ def main():
 
     for vs in streams:
         vs.stop()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
