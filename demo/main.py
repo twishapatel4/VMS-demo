@@ -105,7 +105,7 @@ UNKNOWN_TTL_SECONDS = 7200   # 2 hours
 UNKNOWN_EMA_ALPHA = 0.3      # running avg: new_feat * alpha + old_feat * (1-alpha); 0 = no update
 
 # --- TRACK-LEVEL VOTING (K=1 gallery, smarter query) ---
-TRACK_QUERY_BUFFER = 6           # embeds collected per new track before voting against gallery
+TRACK_QUERY_BUFFER = 3        # [FLOW2-RISK #1] embeds collected per new track before weighted-mean vote. Was 6 pre-FLOW2; lowered to 3 for snappier bind while still filtering bad first frames. Set 1 = first-frame bind, 6 = old behavior.
 REEMBED_EVERY_FRAMES = 15        # how often a bound track contributes a fresh embed (EMA update)
 GALLERY_WRITE_MIN_SCORE = 0.90   # det score required to write to gallery (quality gate)
 GALLERY_WRITE_MIN_SIZE = 40      # px min face size for gallery writes
@@ -901,7 +901,7 @@ def process_frame(frame, now, cam_state, frame_idx):
 
     new_results = []
     pending_crops = []
-    pending_tags = []   # ("UPDATE", tid, eid, weight) | ("BIND", tid, track_box, det_box, weight)
+    pending_tags = []   # ("UPDATE", tid, eid, weight) | ("VOTE", tid, track_box, det_box, weight)
 
     for st in tracks:
         tid = st.track_id
@@ -957,8 +957,9 @@ def process_frame(frame, now, cam_state, frame_idx):
         det_box, lmks, _, fscore = kept_meta[best_i]
         weight = frontality_weight(fscore)
         pending_crops.append(norm_crop(rgb, lmks, size=112))
-        # [FLOW2-RISK #1] BIND tag = first-frame bind (no 6-frame vote buffer).
-        pending_tags.append(("BIND", tid, track_box, det_box, weight))
+        # [FLOW2-RISK #1] VOTE tag = N-frame weighted-mean buffer (TRACK_QUERY_BUFFER).
+        # Lowered from 6 to 3 vs pre-FLOW2 for snappier bind; still filters bad first frames.
+        pending_tags.append(("VOTE", tid, track_box, det_box, weight))
 
     # AdaFace forward only when there is at least one crop (gated by do_identify above).
     if pending_crops:
@@ -976,8 +977,26 @@ def process_frame(frame, now, cam_state, frame_idx):
                 persist_unknown(eid)
                 continue
 
-            # === [FLOW2-RISK #1] first-frame BIND + [FLOW2-RISK #3] hybrid cascade ===
+            # === [FLOW2-RISK #1] N-frame weighted-vote bind + [FLOW2-RISK #3] hybrid cascade ===
             _, tid, track_box, det_box, weight = tag
+
+            # Accumulate (feat, weight) until buffer fills, then weighted-mean → cascade.
+            buf = cam_state.track_query_buf.setdefault(tid, [])
+            buf.append((feat, weight))
+
+            if len(buf) < TRACK_QUERY_BUFFER:
+                # Still collecting — show gray '...' placeholder while waiting.
+                new_results.append((track_box, "...", (200, 200, 200)))
+                continue
+
+            # Weighted mean over buffered embeds. Heavier weight on frontal frames
+            # (frontality_weight in [0.15, 1.0]) → bind embed leans on best-quality views.
+            stack = torch.cat([f for f, _ in buf], dim=0)                        # [N, 512]
+            w_vec = torch.tensor([w for _, w in buf], device=stack.device,
+                                 dtype=stack.dtype).view(-1, 1)                  # [N, 1]
+            feat = (stack * w_vec).sum(dim=0, keepdim=True) / (w_vec.sum() + 1e-8)
+            feat = feat / (torch.norm(feat, dim=1, keepdim=True) + 1e-8)
+            cam_state.track_query_buf.pop(tid, None)
 
             name = "Unknown"
             color = (0, 0, 255)
