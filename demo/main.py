@@ -29,7 +29,7 @@ EMB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'embeddings'
 KNOWN_DIR = os.path.join(EMB_ROOT, 'known')
 UNKNOWN_DIR = os.path.join(EMB_ROOT, 'unknown')
 THRESHOLD = 0.35
-DET_THRESH = 0.70           # RetinaFace confidence - surity this is a face or not
+DET_THRESH = 0.55           # RetinaFace confidence - surity this is a face or not
 NMS_THRESH = 0.25          # merge multiple boundary boxes to one
 MIN_FACE_SIZE = 30          # px, reject tiny faces
 SKIP_FRAMES = 2              # for speed: only run detection/recognition every N frames
@@ -37,10 +37,17 @@ DETECTION_SCALE=1.2
 OSNET_THRESH = 0.80          # body ReID cosine match threshold
 
 # --- DETECTION PERF / FILTER GATES ---
-DETECT_SCALE = 0.5           # downscale frame before RetinaFace forward; boxes scaled back. 1.0 = no downscale.
-ASPECT_MIN = 0.45            # min bbox W/H (rejects vertical/elongated body parts)
+DETECT_SCALE = 1.0           # downscale frame before RetinaFace forward; boxes scaled back. 1.0 = no downscale.
+ASPECT_MIN = 0.30            # min bbox W/H (lowered to admit profile/side faces)
 ASPECT_MAX = 1.4             # max bbox W/H (rejects horizontal/elongated body parts)
 TOPK_GALLERY = 1             # max stored embeddings per gallery entry (top-K matching)
+
+# --- FRONTALITY SOFT-WEIGHTING ---
+# Frontality scores in [0, 1]: 1.0 = frontal, 0.0 = full profile.
+# Used to scale how much each frame's embed contributes to centroid / vote.
+# Not a hard gate — profile frames still contribute, just less.
+FRONTAL_REF = 0.55           # frontality at/above this → full weight (1.0)
+FRONTAL_WEIGHT_FLOOR = 0.15  # weight cannot drop below this (profile still nudges centroid)
 
 # --- LOGGING ---
 STATS_EVERY_FRAMES = 60      # print FPS + gallery stats every N frames
@@ -49,7 +56,8 @@ STATS_EVERY_FRAMES = 60      # print FPS + gallery stats every N frames
 # (label, src) — label shown on window + logs. src can be int (local) or URL (remote stream).
 CAM_SOURCES = [
     ("Laptop",  0),
-    ("Webcam",  "http://192.168.29.97:5000/video"),
+    ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
+    # ("Webcam",  "http://192.168.29.218:5000"), # JeelBhai
 ]
 
 # --- SHORT-TERM MEMORY (Temporary Unknown Gallery) ---
@@ -58,10 +66,10 @@ UNKNOWN_TTL_SECONDS = 7200   # 2 hours
 UNKNOWN_EMA_ALPHA = 0.3      # running avg: new_feat * alpha + old_feat * (1-alpha); 0 = no update
 
 # --- TRACK-LEVEL VOTING (K=1 gallery, smarter query) ---
-TRACK_QUERY_BUFFER = 4           # embeds collected per new track before voting against gallery
+TRACK_QUERY_BUFFER = 6           # embeds collected per new track before voting against gallery
 REEMBED_EVERY_FRAMES = 15        # how often a bound track contributes a fresh embed (EMA update)
 GALLERY_WRITE_MIN_SCORE = 0.90   # det score required to write to gallery (quality gate)
-GALLERY_WRITE_MIN_SIZE = 50      # px min face size for gallery writes
+GALLERY_WRITE_MIN_SIZE = 40      # px min face size for gallery writes
 
 # --- BYTETRACK (per-cam motion tracker; binds local track_id -> label) ---
 BYTETRACK_TRACK_THRESH = 0.5     # min det score to confirm a new track
@@ -235,19 +243,19 @@ def norm_crop(img, landmarks, size=112):
 
 def valid_landmarks(lmks, box):
     """Geometric sanity check on 5 landmarks (R-eye, L-eye, nose, R-mouth, L-mouth) vs bbox.
-    Rejects garbage landmark layouts produced when detector fires on non-faces (elbow, fist, etc.)."""
+    Softened to admit profile faces — only rejects truly garbage layouts (elbow, fist, etc.)."""
     x1, y1, x2, y2 = box
     w, h = max(1, x2 - x1), max(1, y2 - y1)
-    margin = 0.05 * max(w, h)
+    margin = 0.15 * max(w, h)   # widened from 0.05 — profile far-side landmarks often near/past bbox edge
 
     # All landmarks must sit (mostly) inside the bbox.
     if (lmks[:, 0].min() < x1 - margin or lmks[:, 0].max() > x2 + margin or
         lmks[:, 1].min() < y1 - margin or lmks[:, 1].max() > y2 + margin):
         return False
 
-    # Eye separation should be a meaningful fraction of face width.
+    # Only reject if eyes collapse to a single point (true garbage). Profile eye_dist ~0.05*w is fine.
     eye_dist = float(np.linalg.norm(lmks[0] - lmks[1]))
-    if eye_dist < 0.15 * w:
+    if eye_dist < 0.02 * w:
         return False
 
     # Eyes must be above mouth corners (image y increases downward).
@@ -255,6 +263,39 @@ def valid_landmarks(lmks, box):
         return False
 
     return True
+
+
+def frontality_score(lmks):
+    """Cheap yaw proxy from 5 landmarks. Returns [0, 1]: 1.0 = frontal, 0.0 = full profile.
+    Cues: (a) eye-separation ratio (profile collapses eyes in 2D),
+          (b) nose horizontal offset from eye midpoint (profile shifts nose far)."""
+    re, le = lmks[0], lmks[1]
+    nose = lmks[2]
+    rm, lm = lmks[3], lmks[4]
+
+    eye_dist   = float(np.linalg.norm(re - le))
+    mouth_dist = float(np.linalg.norm(rm - lm))
+    face_w = max(eye_dist, mouth_dist) * 2.5
+    if face_w < 1e-3:
+        return 0.0
+
+    eye_ratio  = eye_dist / face_w
+    eye_mid_x  = 0.5 * (re[0] + le[0])
+    nose_off   = abs(nose[0] - eye_mid_x) / max(eye_dist, 1e-3)
+
+    eye_score  = min(1.0, eye_ratio / 0.30)
+    nose_score = max(0.0, 1.0 - nose_off / 0.50)
+    return float(0.5 * eye_score + 0.5 * nose_score)
+
+
+def frontality_weight(fscore):
+    """Map frontality [0,1] → embed contribution weight, clipped to [FLOOR, 1.0]."""
+    w = fscore / max(FRONTAL_REF, 1e-6)
+    if w > 1.0:
+        w = 1.0
+    if w < FRONTAL_WEIGHT_FLOOR:
+        w = FRONTAL_WEIGHT_FLOOR
+    return float(w)
 
 
 def body_crop(frame, box, scale_h=3.5, scale_w=1.5):
@@ -392,12 +433,12 @@ class UnknownGallery:
                 best_eid = eid
         return best_eid, best_sim
 
-    def assign(self, feat, now):
+    def assign(self, feat, now, weight=1.0):
         """Returns (eid, sim). Reuses entry (EMA-blend slot) if match, else creates new."""
         with self.lock:
             best_eid, best_sim = self._best_match_unsafe(feat)
             if best_eid is not None and best_sim >= self.match_thresh:
-                self._ema_blend_unsafe(best_eid, feat, now)
+                self._ema_blend_unsafe(best_eid, feat, now, weight=weight)
                 return best_eid, best_sim
             eid = self.next_id
             self.next_id += 1
@@ -408,12 +449,14 @@ class UnknownGallery:
             }
             return eid, 0.0
 
-    def _ema_blend_unsafe(self, eid, feat, now):
-        """Caller must hold lock. K=1 EMA: blend fresh embed into single stored slot, re-normalize."""
+    def _ema_blend_unsafe(self, eid, feat, now, weight=1.0):
+        """Caller must hold lock. K=1 EMA: blend fresh embed into single stored slot.
+        `weight` in [0,1] scales effective alpha — frontal frame uses full α, profile uses fraction."""
         e = self.entries[eid]
         if e['embeds']:
+            alpha = UNKNOWN_EMA_ALPHA * float(weight)
             old = e['embeds'][0]
-            blended = UNKNOWN_EMA_ALPHA * feat + (1.0 - UNKNOWN_EMA_ALPHA) * old
+            blended = alpha * feat + (1.0 - alpha) * old
             blended = blended / (torch.norm(blended, dim=1, keepdim=True) + 1e-8)
             e['embeds'][0] = blended.detach().clone()
         else:
@@ -429,11 +472,11 @@ class UnknownGallery:
                 return best_eid, best_sim
             return None, best_sim
 
-    def update_entry(self, eid, feat, now):
-        """EMA-blend fresh embed into stored slot. Creates entry if absent."""
+    def update_entry(self, eid, feat, now, weight=1.0):
+        """EMA-blend fresh embed into stored slot, scaled by weight. Creates entry if absent."""
         with self.lock:
             if eid in self.entries:
-                self._ema_blend_unsafe(eid, feat, now)
+                self._ema_blend_unsafe(eid, feat, now, weight=weight)
             else:
                 self.entries[eid] = {
                     'embeds': deque([feat.detach().clone()], maxlen=self.maxlen),
@@ -650,7 +693,7 @@ def process_frame(frame, now, cam_state, frame_idx):
         dets[:, :4] *= inv
         dets[:, 5:15] *= inv
 
-    kept_meta = []      # (box_int, lmks, det_score)
+    kept_meta = []      # (box_int, lmks, det_score, frontality)
     tracker_input = []
     if dets is not None and len(dets) > 0:
         for det in dets:
@@ -664,7 +707,8 @@ def process_frame(frame, now, cam_state, frame_idx):
                 continue
             if not valid_landmarks(lmks, box):
                 continue
-            kept_meta.append((box, lmks, score))
+            fscore = frontality_score(lmks)
+            kept_meta.append((box, lmks, score, fscore))
             tracker_input.append([float(box[0]), float(box[1]), float(box[2]), float(box[3]), score])
 
     tracker_arr = (np.asarray(tracker_input, dtype=np.float32)
@@ -673,21 +717,21 @@ def process_frame(frame, now, cam_state, frame_idx):
 
     new_results = []
     pending_crops = []
-    pending_tags = []   # ("UPDATE", tid, eid) | ("VOTE", tid, track_box, det_box)
+    pending_tags = []   # ("UPDATE", tid, eid, weight) | ("VOTE", tid, track_box, det_box, weight)
 
     for st in tracks:
         tid = st.track_id
         track_box = st.tlbr.astype(int)
 
-        # Best-IoU det for this track (used for both UPDATE quality gate and VOTE crop).
+        # Best-IoU det for this track.
         best_i, best_iou = -1, 0.0
-        for i, (b, _, _) in enumerate(kept_meta):
+        for i, (b, _, _, _) in enumerate(kept_meta):
             v = _iou_xyxy(track_box, b)
             if v > best_iou:
                 best_iou = v
                 best_i = i
 
-        # Branch A: tid already labeled → reuse + maybe contribute fresh embed to EMA.
+        # Branch A: tid already labeled → reuse + maybe contribute frontality-weighted EMA update.
         if tid in cam_state.track_to_label:
             name, color = cam_state.track_to_label[tid]
             new_results.append((track_box, name, color))
@@ -700,25 +744,27 @@ def process_frame(frame, now, cam_state, frame_idx):
             if frame_idx - last < REEMBED_EVERY_FRAMES:
                 continue
 
-            det_box, lmks, score = kept_meta[best_i]
+            det_box, lmks, score, fscore = kept_meta[best_i]
             w = det_box[2] - det_box[0]
             h = det_box[3] - det_box[1]
             if score < GALLERY_WRITE_MIN_SCORE or min(w, h) < GALLERY_WRITE_MIN_SIZE:
                 continue
 
+            weight = frontality_weight(fscore)
             pending_crops.append(norm_crop(rgb, lmks, size=112))
-            pending_tags.append(("UPDATE", tid, eid))
+            pending_tags.append(("UPDATE", tid, eid, weight))
             cam_state.track_last_embed[tid] = frame_idx
             continue
 
-        # Branch B: tid not yet bound → need TRACK_QUERY_BUFFER embeds before voting.
+        # Branch B: tid not yet bound → need TRACK_QUERY_BUFFER embeds (weighted vote).
         if best_i < 0 or best_iou < TRACK_DET_IOU_MIN:
             new_results.append((track_box, "...", (200, 200, 200)))
             continue
 
-        det_box, lmks, _ = kept_meta[best_i]
+        det_box, lmks, _, fscore = kept_meta[best_i]
+        weight = frontality_weight(fscore)
         pending_crops.append(norm_crop(rgb, lmks, size=112))
-        pending_tags.append(("VOTE", tid, track_box, det_box))
+        pending_tags.append(("VOTE", tid, track_box, det_box, weight))
 
     if pending_crops:
         batch_np = np.stack(pending_crops, axis=0)
@@ -729,22 +775,24 @@ def process_frame(frame, now, cam_state, frame_idx):
             feat = feats[i:i+1]
 
             if tag[0] == "UPDATE":
-                _, tid, eid = tag
-                unknown_gallery.update_entry(eid, feat, now)
+                _, tid, eid, weight = tag
+                unknown_gallery.update_entry(eid, feat, now, weight=weight)
                 persist_unknown(eid)
                 continue
 
-            # VOTE — accumulate; only resolve once buffer full.
-            _, tid, track_box, det_box = tag
+            # VOTE — accumulate (feat, weight); resolve once buffer full via weighted mean.
+            _, tid, track_box, det_box, weight = tag
             buf = cam_state.track_query_buf.setdefault(tid, [])
-            buf.append(feat)
+            buf.append((feat, weight))
 
             if len(buf) < TRACK_QUERY_BUFFER:
                 new_results.append((track_box, "...", (200, 200, 200)))
                 continue
 
-            stack = torch.cat(buf, dim=0)
-            mean_feat = stack.mean(dim=0, keepdim=True)
+            stack = torch.cat([f for f, _ in buf], dim=0)                        # [N, 512]
+            w_vec = torch.tensor([w for _, w in buf], device=stack.device,
+                                 dtype=stack.dtype).view(-1, 1)                  # [N, 1]
+            mean_feat = (stack * w_vec).sum(dim=0, keepdim=True) / (w_vec.sum() + 1e-8)
             mean_feat = mean_feat / (torch.norm(mean_feat, dim=1, keepdim=True) + 1e-8)
             cam_state.track_query_buf.pop(tid, None)
 
@@ -764,7 +812,7 @@ def process_frame(frame, now, cam_state, frame_idx):
             if not matched_known:
                 face_eid, _ = unknown_gallery.find_match(mean_feat)
                 if face_eid is not None:
-                    unknown_gallery.update_entry(face_eid, mean_feat, now)
+                    unknown_gallery.update_entry(face_eid, mean_feat, now, weight=1.0)
                     assigned_eid = face_eid
                 else:
                     bfeat = None
@@ -775,12 +823,12 @@ def process_frame(frame, now, cam_state, frame_idx):
                             body_eid, _ = body_gallery.find_match(bfeat)
                             if body_eid is not None:
                                 assigned_eid = body_eid
-                                unknown_gallery.update_entry(assigned_eid, mean_feat, now)
-                                body_gallery.update_entry(assigned_eid, bfeat, now)
+                                unknown_gallery.update_entry(assigned_eid, mean_feat, now, weight=1.0)
+                                body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
                     if assigned_eid is None:
-                        assigned_eid, _ = unknown_gallery.assign(mean_feat, now)
+                        assigned_eid, _ = unknown_gallery.assign(mean_feat, now, weight=1.0)
                         if bfeat is not None:
-                            body_gallery.update_entry(assigned_eid, bfeat, now)
+                            body_gallery.update_entry(assigned_eid, bfeat, now, weight=1.0)
                 persist_unknown(assigned_eid)
                 name = f"Unknown_{assigned_eid:03d}"
                 color = (0, 0, 255)
