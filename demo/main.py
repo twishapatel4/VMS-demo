@@ -82,6 +82,24 @@ TOPK_GALLERY = 1             # max stored embeddings per gallery entry (top-K ma
 FRONTAL_REF = 0.55           # frontality at/above this → full weight (1.0)
 FRONTAL_WEIGHT_FLOOR = 0.15  # weight cannot drop below this (profile still nudges centroid)
 
+# === [FLOW2-RISK #8] frontality-hard-reject + landmark-geometry-sanity ======
+# CHANGE : detections with frontality_score < MIN_FRONTALITY are rejected
+#          outright (not just weighted). valid_landmarks() also enforces
+#          stricter geometric sanity (nose between eyes horizontally + between
+#          eye/mouth lines vertically + mouth/eye width ratio in [0.4, 1.8]).
+# REASON : RetinaFace fires on back-of-head / hair patches and fabricates
+#          5 landmarks. Without these gates, those false positives produce
+#          look-alike low-info embeds that cluster into the same Unknown_NNN
+#          eid — different people getting the same ID.
+# REVERT : set MIN_FRONTALITY = 0.0 and remove the extra geometry checks
+#          inside valid_landmarks(). Soft frontality weighting still works.
+# ACCURACY: back-of-head / extreme profile rejected → fewer bogus eids.
+#          True 3/4-profile faces (frontality ~0.25-0.40) still admitted.
+#          Risk: very extreme side profiles (frontality < 0.20) now produce
+#          no label until person turns more toward camera.
+# ===========================================================================
+MIN_FRONTALITY = 0.20
+
 # --- LOGGING ---
 STATS_EVERY_FRAMES = 60      # print FPS + gallery stats every N frames
 
@@ -89,7 +107,7 @@ STATS_EVERY_FRAMES = 60      # print FPS + gallery stats every N frames
 # (label, src) — label shown on window + logs. src can be int (local) or URL (remote stream).
 CAM_SOURCES = [
     ("Laptop",  0),
-    ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
+    # ("Webcam",  "http://192.168.29.97:5000/video"), #ArpanBhai
     ("Webcam1",  "http://192.168.29.218:5000/video"), # JeelBhai~
 ]
 
@@ -281,8 +299,12 @@ def norm_crop(img, landmarks, size=112):
 
 
 def valid_landmarks(lmks, box):
-    """Geometric sanity check on 5 landmarks (R-eye, L-eye, nose, R-mouth, L-mouth) vs bbox.
-    Softened to admit profile faces — only rejects truly garbage layouts (elbow, fist, etc.)."""
+    """LOOSE landmark sanity — used by Stage 1 (ByteTrack input).
+
+    Pre-FLOW2 checks only. Permissive enough that profile / hand-on-face
+    detections still feed the tracker, keeping tracks alive during occlusion.
+    Stricter geometry lives in valid_landmarks_strict() below.
+    """
     x1, y1, x2, y2 = box
     w, h = max(1, x2 - x1), max(1, y2 - y1)
     margin = 0.15 * max(w, h)   # widened from 0.05 — profile far-side landmarks often near/past bbox edge
@@ -299,6 +321,46 @@ def valid_landmarks(lmks, box):
 
     # Eyes must be above mouth corners (image y increases downward).
     if lmks[0, 1] > lmks[3, 1] or lmks[1, 1] > lmks[4, 1]:
+        return False
+
+    return True
+
+
+def valid_landmarks_strict(lmks, box):
+    """STRICT geometry — used by Stage 2 (identify_ok flag for AdaFace embed).
+
+    Rejects back-of-head / hair-patch fakes where RetinaFace fabricates 5 landmarks
+    that pass loose checks but violate real-face geometry. Tracking is unaffected:
+    failing this only suppresses identification on the current frame.
+    See [FLOW2-RISK #8] for revert.
+    """
+    x1, y1, x2, y2 = box
+    w, h = max(1, x2 - x1), max(1, y2 - y1)
+    re, le = lmks[0], lmks[1]
+    nose = lmks[2]
+    rm, lm = lmks[3], lmks[4]
+
+    eye_dist = float(np.linalg.norm(re - le))
+    if eye_dist < 1e-3:
+        return False
+
+    # Nose horizontal sanity. Real face: nose between eyes (allow ±30% of eye span for profile yaw).
+    eye_x_min, eye_x_max = min(re[0], le[0]), max(re[0], le[0])
+    eye_span = max(eye_x_max - eye_x_min, 1.0)
+    margin_x = 0.3 * eye_span
+    if nose[0] < eye_x_min - margin_x or nose[0] > eye_x_max + margin_x:
+        return False
+
+    # Nose vertical sanity: between eye line and mouth line (with small tolerance).
+    eye_y = 0.5 * (re[1] + le[1])
+    mouth_y = 0.5 * (rm[1] + lm[1])
+    if nose[1] < eye_y - 0.10 * h or nose[1] > mouth_y + 0.10 * h:
+        return False
+
+    # Mouth/eye width ratio sanity. Real face ratio ~0.5-1.5; back-of-head fakes random.
+    mouth_dist = float(np.linalg.norm(rm - lm))
+    ratio = mouth_dist / eye_dist
+    if ratio < 0.4 or ratio > 1.8:
         return False
 
     return True
@@ -877,7 +939,18 @@ def process_frame(frame, now, cam_state, frame_idx):
         dets[:, :4] *= inv
         dets[:, 5:15] *= inv
 
-    kept_meta = []      # (box_int, lmks, det_score, frontality)
+    # === [FLOW2-RISK #9] two-stage detection filter ============================
+    # Stage 1 (size + aspect): every det that passes feeds ByteTrack. Keeps tracks
+    #         alive during occlusion, profile turns, hand-on-face — same as main
+    #         branch behavior. ByteTrack also predicts via Kalman across short
+    #         dropouts (BYTETRACK_BUFFER frames).
+    # Stage 2 (landmarks + frontality): stricter gates that mark a det as
+    #         identify_ok=False when face is not usable for AdaFace embed
+    #         (profile too extreme, back-of-head, hand-occluded). Branch B
+    #         won't bind a label from these frames; Branch A won't refresh.
+    # REVERT : merge both stages back into a single reject block.
+    # ===========================================================================
+    kept_meta = []      # (box_int, lmks, det_score, frontality, identify_ok)
     tracker_input = []
     if dets is not None and len(dets) > 0:
         for det in dets:
@@ -885,15 +958,30 @@ def process_frame(frame, now, cam_state, frame_idx):
             lmks = det[5:15].reshape(5, 2).astype(np.float32)
             score = float(det[4])
             w, h = box[2] - box[0], box[3] - box[1]
+
+            # --- Stage 1: pre-FLOW2 loose gates feed ByteTrack ---
+            # Same filter set as main branch had: size + aspect + LOOSE landmarks.
+            # Keeps tracker behavior identical to pre-FLOW2 so occlusion / profile
+            # / hand-on-face frames still maintain track continuity.
             if min(w, h) < MIN_FACE_SIZE:
                 continue
             if not (ASPECT_MIN < w / max(1, h) < ASPECT_MAX):
                 continue
             if not valid_landmarks(lmks, box):
                 continue
-            fscore = frontality_score(lmks)
-            kept_meta.append((box, lmks, score, fscore))
             tracker_input.append([float(box[0]), float(box[1]), float(box[2]), float(box[3]), score])
+
+            # --- Stage 2: strict gates decide identify_ok (only affects AdaFace path) ---
+            fscore = frontality_score(lmks)
+            identify_ok = True
+            if not valid_landmarks_strict(lmks, box):
+                identify_ok = False
+            # [FLOW2-RISK #8] hard reject anything below MIN_FRONTALITY for ID,
+            # but the det still went to ByteTrack so track survives.
+            if identify_ok and fscore < MIN_FRONTALITY:
+                identify_ok = False
+
+            kept_meta.append((box, lmks, score, fscore, identify_ok))
 
     tracker_arr = (np.asarray(tracker_input, dtype=np.float32)
                    if tracker_input else np.empty((0, 5), dtype=np.float32))
@@ -909,7 +997,7 @@ def process_frame(frame, now, cam_state, frame_idx):
 
         # Best-IoU det for this track.
         best_i, best_iou = -1, 0.0
-        for i, (b, _, _, _) in enumerate(kept_meta):
+        for i, (b, _, _, _, _) in enumerate(kept_meta):
             v = _iou_xyxy(track_box, b)
             if v > best_iou:
                 best_iou = v
@@ -932,7 +1020,11 @@ def process_frame(frame, now, cam_state, frame_idx):
             if frame_idx - last < REEMBED_EVERY_FRAMES:
                 continue
 
-            det_box, lmks, score, fscore = kept_meta[best_i]
+            det_box, lmks, score, fscore, identify_ok = kept_meta[best_i]
+            # [FLOW2-RISK #9] don't EMA-refresh from a frame that can't be identified
+            # (profile too extreme, hand-on-face). Keeps gallery clean during occlusion.
+            if not identify_ok:
+                continue
             w = det_box[2] - det_box[0]
             h = det_box[3] - det_box[1]
             if score < GALLERY_WRITE_MIN_SCORE or min(w, h) < GALLERY_WRITE_MIN_SIZE:
@@ -954,7 +1046,13 @@ def process_frame(frame, now, cam_state, frame_idx):
             new_results.append((track_box, "...", (200, 200, 200)))
             continue
 
-        det_box, lmks, _, fscore = kept_meta[best_i]
+        det_box, lmks, _, fscore, identify_ok = kept_meta[best_i]
+        # [FLOW2-RISK #9] tid is being tracked, but this frame isn't usable for ID.
+        # Don't accumulate vote on degraded embed; show placeholder + wait for
+        # better frame. ByteTrack keeps the track alive in the meantime.
+        if not identify_ok:
+            new_results.append((track_box, "...", (200, 200, 200)))
+            continue
         weight = frontality_weight(fscore)
         pending_crops.append(norm_crop(rgb, lmks, size=112))
         # [FLOW2-RISK #1] VOTE tag = N-frame weighted-mean buffer (TRACK_QUERY_BUFFER).
